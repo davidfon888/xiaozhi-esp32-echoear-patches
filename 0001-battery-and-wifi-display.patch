@@ -1,0 +1,193 @@
+diff --git a/main/boards/esp-vocat/esp_vocat.cc b/main/boards/esp-vocat/esp_vocat.cc
+index 4e14c4a..aeaca14 100644
+--- a/main/boards/esp-vocat/esp_vocat.cc
++++ b/main/boards/esp-vocat/esp_vocat.cc
+@@ -2,6 +2,10 @@
+ #include "codecs/box_audio_codec.h"
+ #include "display/lcd_display.h"
+ #include "display/emote_display.h"
++#include "expression_emote/emote_api.h"
++#include "expression_emote/emote_assets.h"
++#include "gfx.h"
++#include <esp_wifi.h>
+ #include "application.h"
+ #include "button.h"
+ #include "config.h"
+@@ -272,40 +276,146 @@ gpio_num_t TOUCH_PAD2 = TOUCH_PAD2_1;
+ gpio_num_t UART1_TX = UART1_TX_1;
+ gpio_num_t UART1_RX = UART1_RX_1;
+ 
++// BQ27220-style fuel gauge at I2C 0x55. Reads voltage / SOC, pushes percent
++// + charging state to the emote framework via EMOTE_MGR_EVT_BAT so the
++// existing battery_label / charge_icon widgets in the 360x360 layout get
++// real data.
+ class Charge : public I2cDevice {
+ public:
+     Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
+     {
+-        read_buffer_ = new uint8_t[8];
+     }
+-    ~Charge()
++
++    void SetDisplay(emote::EmoteDisplay* d) { display_ = d; }
++
++    void Sample()
+     {
+-        delete[] read_buffer_;
++        uint8_t regs[16] = {0};
++        ReadRegs(0x06, regs, 16);
++        uint16_t voltage_mv = (uint16_t)(regs[3] << 8 | regs[2]);   // 0x08-0x09
++        int16_t  current_ma = (int16_t) (regs[7] << 8 | regs[6]);   // 0x0C-0x0D
++
++        uint8_t soc_regs[4] = {0};
++        ReadRegs(0x2C, soc_regs, 4);
++        uint16_t soc_pct = (uint16_t)(soc_regs[1] << 8 | soc_regs[0]);
++
++        if (voltage_mv < 1500 || voltage_mv > 9500) {
++            valid_ = false;
++            return;
++        }
++
++        if (soc_pct <= 100) {
++            percent_ = (int)soc_pct;
++        } else {
++            uint16_t v = (voltage_mv > 4500) ? (voltage_mv / 2) : voltage_mv;
++            if (v <= 3000)       percent_ = 0;
++            else if (v >= 4200)  percent_ = 100;
++            else                 percent_ = (int)((v - 3000) * 100 / 1200);
++        }
++
++        is_charging_    = (current_ma >  50);
++        is_discharging_ = (current_ma < -50);
++        voltage_mv_ = voltage_mv;
++        current_ma_ = current_ma;
++        valid_ = true;
+     }
+-    void Printcharge()
++
++    void PushToDisplay()
+     {
+-        ReadRegs(0x08, read_buffer_, 2);
+-        ReadRegs(0x0c, read_buffer_ + 2, 2);
+-        ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
++        if (!valid_ || !display_) return;
++        emote_handle_t h = display_->GetEmoteHandle();
++        if (!h) return;
++        char msg[16];
++        snprintf(msg, sizeof(msg), "%d,%d", is_charging_ ? 1 : 0, percent_);
++        emote_set_event_msg(h, EMOTE_MGR_EVT_BAT, msg);
++        PushWifi(h);
++    }
+ 
+-        int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
+-        int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
+-        
+-        // Use the variables to avoid warnings (can be removed if actual implementation uses them)
+-        (void)voltage;
+-        (void)current;
++    void PushWifi(emote_handle_t h)
++    {
++        if (wifi_obj_ == nullptr) {
++            wifi_obj_ = emote_get_obj_by_name(h, "wifi_icon");
++            if (wifi_obj_ == nullptr) {
++                wifi_obj_ = emote_create_obj_by_type(h, "image", "wifi_icon");
++                if (wifi_obj_) {
++                    emote_lock(h);
++                    gfx_obj_align(wifi_obj_, GFX_ALIGN_TOP_MID, 90, 37);
++                    gfx_obj_set_visible(wifi_obj_, false);
++                    emote_unlock(h);
++                    ESP_LOGI(TAG, "WifiIcon: created custom widget at top_mid+90,37");
++                } else {
++                    return;
++                }
++            }
++        }
++        if (!wifi_ok_valid_) {
++            icon_data_t* ok = nullptr;
++            if (emote_get_icon_data_by_name(h, "icon_wifi_ok", &ok) == ESP_OK && ok) {
++                memcpy(&ok_dsc_.header, ok->data, sizeof(gfx_image_header_t));
++                ok_dsc_.data = (const uint8_t*)ok->data + sizeof(gfx_image_header_t);
++                ok_dsc_.data_size = ok->size - sizeof(gfx_image_header_t);
++                wifi_ok_valid_ = true;
++                ESP_LOGI(TAG, "WifiIcon: cached icon_wifi_ok");
++            }
++        }
++        if (!wifi_fail_valid_) {
++            icon_data_t* fail = nullptr;
++            if (emote_get_icon_data_by_name(h, "icon_WiFi_fail", &fail) == ESP_OK && fail) {
++                memcpy(&fail_dsc_.header, fail->data, sizeof(gfx_image_header_t));
++                fail_dsc_.data = (const uint8_t*)fail->data + sizeof(gfx_image_header_t);
++                fail_dsc_.data_size = fail->size - sizeof(gfx_image_header_t);
++                wifi_fail_valid_ = true;
++                ESP_LOGI(TAG, "WifiIcon: cached icon_WiFi_fail");
++            }
++        }
++        if (!wifi_ok_valid_ && !wifi_fail_valid_) return;
++
++        wifi_ap_record_t ap = {};
++        bool connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
++        if (connected == last_wifi_state_) return;
++        last_wifi_state_ = connected ? 1 : 0;
++
++        gfx_image_dsc_t* dsc = connected ? (wifi_ok_valid_ ? &ok_dsc_ : nullptr)
++                                         : (wifi_fail_valid_ ? &fail_dsc_ : nullptr);
++        if (!dsc) return;
++        emote_lock(h);
++        gfx_img_set_src(wifi_obj_, dsc);
++        gfx_obj_set_visible(wifi_obj_, true);
++        emote_unlock(h);
++        ESP_LOGI(TAG, "WifiIcon: %s", connected ? "connected" : "disconnected");
+     }
++
+     static void TaskFunction(void *pvParameters)
+     {
+         Charge* charge = static_cast<Charge*>(pvParameters);
+         while (true) {
+-            charge->Printcharge();
+-            vTaskDelay(pdMS_TO_TICKS(300));
++            charge->Sample();
++            charge->PushToDisplay();
++            vTaskDelay(pdMS_TO_TICKS(2000));
+         }
+     }
+ 
++    bool IsValid() const { return valid_; }
++    int  GetPercent() const { return percent_; }
++    bool IsCharging() const { return is_charging_; }
++    bool IsDischarging() const { return is_discharging_; }
++
+ private:
+-    uint8_t* read_buffer_ = nullptr;
++    emote::EmoteDisplay* display_ = nullptr;
++    bool valid_ = false;
++    int  percent_ = -1;
++    bool is_charging_ = false;
++    bool is_discharging_ = false;
++    uint16_t voltage_mv_ = 0;
++    int16_t  current_ma_ = 0;
++
++    bool wifi_inited_ = false;
++    gfx_obj_t* wifi_obj_ = nullptr;
++    gfx_image_dsc_t ok_dsc_ = {};
++    gfx_image_dsc_t fail_dsc_ = {};
++    bool wifi_ok_valid_ = false;
++    bool wifi_fail_valid_ = false;
++    int  last_wifi_state_ = -1;
+ };
+ 
+ class Cst816s : public I2cDevice {
+@@ -969,6 +1079,14 @@ public:
+ 
+         InitializeSpi();
+         InitializeSt77916Display(pcb_version);
++#if CONFIG_USE_EMOTE_MESSAGE_STYLE
++        if (charge_ != nullptr && display_ != nullptr) {
++            charge_->SetDisplay(static_cast<emote::EmoteDisplay*>(display_));
++            ESP_LOGI(TAG, "Charge::SetDisplay wired up");
++        } else {
++            ESP_LOGW(TAG, "Charge::SetDisplay skipped: charge_=%p display_=%p", charge_, display_);
++        }
++#endif
+         InitializeButtons();
+         InitializeCapacitiveTouchPads();
+ #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

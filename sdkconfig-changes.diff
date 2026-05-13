@@ -1,0 +1,23 @@
+# sdkconfig diff against vanilla v2.2.6 (xiaozhi-esp32 49ac8a6)
+# Apply by sed -i 或者 menuconfig 改 5 项
+--- 5 lines that differ ---
+- CONFIG_USE_DEFAULT_MESSAGE_STYLE=y
++ # CONFIG_USE_DEFAULT_MESSAGE_STYLE is not set
+- # CONFIG_USE_EMOTE_MESSAGE_STYLE is not set
++ CONFIG_USE_EMOTE_MESSAGE_STYLE=y
+- CONFIG_FLASH_DEFAULT_ASSETS=y
++ # CONFIG_FLASH_DEFAULT_ASSETS is not set
+- # CONFIG_FLASH_EXPRESSION_ASSETS is not set
++ CONFIG_FLASH_EXPRESSION_ASSETS=y
+- CONFIG_MMAP_FILE_NAME_LENGTH=16
++ CONFIG_MMAP_FILE_NAME_LENGTH=32
+
+# Apply in one shot via sed:
+# sed -i \
+#   -e 's|^CONFIG_USE_DEFAULT_MESSAGE_STYLE=y$|# CONFIG_USE_DEFAULT_MESSAGE_STYLE is not set|' \
+#   -e 's|^# CONFIG_USE_EMOTE_MESSAGE_STYLE is not set$|CONFIG_USE_EMOTE_MESSAGE_STYLE=y|' \
+#   -e 's|^CONFIG_FLASH_DEFAULT_ASSETS=y$|# CONFIG_FLASH_DEFAULT_ASSETS is not set|' \
+#   -e 's|^# CONFIG_FLASH_EXPRESSION_ASSETS is not set$|CONFIG_FLASH_EXPRESSION_ASSETS=y|' \
+#   -e 's|^CONFIG_MMAP_FILE_NAME_LENGTH=16$|CONFIG_MMAP_FILE_NAME_LENGTH=32|' \
+#   sdkconfig
+# 然后 idf.py reconfigure 让 Kconfig propagate (其实 FLASH_EXPRESSION_ASSETS 会自动跟 EMOTE_MESSAGE_STYLE 联动)
