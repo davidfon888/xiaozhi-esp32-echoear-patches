@@ -1,0 +1,288 @@
+From 0a3b0d02ea851e815aaee900fc32bbc86d217920 Mon Sep 17 00:00:00 2001
+From: dingtalk_grwsfu <zhiwei.feng@orangedental.cn>
+Date: Sun, 17 May 2026 15:54:33 +0800
+Subject: [PATCH] esp-vocat: double-tap meeting mode + long-press volume +
+ persistent banner + volume defaults
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Tested live on `ac:a7:04:e4:5c:f0` (Mac mini lane agent:xiaozhi:minion-echoear)
+with server-side minion plugin patches that accept the `meeting.toggle` MCP
+notification + volume voice intent.
+
+4 changes:
+
+1. Double-tap touchscreen (TOUCH_RELEASE within 600 ms of previous release)
+   sends `{"jsonrpc":"2.0","method":"meeting.toggle"}` over MCP. The 2nd tap
+   intentionally SKIPS ToggleChatState — calling it twice rapidly tore down
+   the WS the 1st tap had just opened, killing the meeting.toggle frame
+   in-flight (1006 close).
+
+2. Long-press touchscreen (TOUCH_HOLD held >= 1.5 s) cycles output volume
+   through {30,50,70,95,100} and shows "🔊 音量 XX" notification. The
+   release that ends a long-press is suppressed so it doesn't also fire
+   tap / double-tap actions. (ESP-VoCat's optional side touch slider would
+   normally handle this — this device doesn't have one.)
+
+3. EmoteDisplay::SetMeetingMode(bool) hooks SetStatus and SetChatMessage
+   so a persistent "🎙 会议·静听" bubble keeps being re-applied while
+   meeting mode is on. Without this, state-machine updates (connecting →
+   listening → idle) overwrite the indicator within ~500 ms.
+
+4. Audio defaults bumped: header default 70 → 95 and Start() floor 10 → 80
+   (if NVS-stored value < 30, force to 80). Original 10 produced a barely
+   audible TTS; users wouldn't realize the device was responding.
+---
+ main/audio/audio_codec.cc          |   8 +--
+ main/audio/audio_codec.h           |   2 +-
+ main/boards/esp-vocat/esp_vocat.cc | 107 +++++++++++++++++++++++++----
+ main/display/emote_display.cc      |  27 ++++++++
+ main/display/emote_display.h       |   7 ++
+ 5 files changed, 134 insertions(+), 17 deletions(-)
+
+diff --git a/main/audio/audio_codec.cc b/main/audio/audio_codec.cc
+index 03e2baa..d3091c8 100644
+--- a/main/audio/audio_codec.cc
++++ b/main/audio/audio_codec.cc
+@@ -29,12 +29,12 @@ bool AudioCodec::InputData(std::vector<int16_t>& data) {
+ void AudioCodec::Start() {
+     Settings settings("audio", false);
+     output_volume_ = settings.GetInt("output_volume", output_volume_);
+-    if (output_volume_ <= 0) {
+-        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)", output_volume_);
+-        output_volume_ = 10;
++    if (output_volume_ < 30) {
++        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (80)", output_volume_);
++        output_volume_ = 80;
+     }
+ 
+-    ESP_LOGI(TAG, "Audio codec started");
++    ESP_LOGI(TAG, "Audio codec started, output_volume=%d", output_volume_);
+ }
+ 
+ void AudioCodec::SetOutputVolume(int volume) {
+diff --git a/main/audio/audio_codec.h b/main/audio/audio_codec.h
+index 819e646..7ae724f 100644
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -51,7 +51,7 @@ protected:
+     int output_sample_rate_ = 0;
+     int input_channels_ = 1;
+     int output_channels_ = 1;
+-    int output_volume_ = 70;
++    int output_volume_ = 95;
+     float input_gain_ = 0.0;
+ 
+     virtual int Read(int16_t* dest, int samples) = 0;
+diff --git a/main/boards/esp-vocat/esp_vocat.cc b/main/boards/esp-vocat/esp_vocat.cc
+index aeaca14..c999a1b 100644
+--- a/main/boards/esp-vocat/esp_vocat.cc
++++ b/main/boards/esp-vocat/esp_vocat.cc
+@@ -717,6 +717,21 @@ private:
+             return;
+         }
+ 
++        // Double-tap → send MCP `meeting.toggle` notification to server +
++        // immediately update the local display so the user gets instant
++        // feedback even if the WS round-trip drops the server reply.
++        // Local meeting state is owned by the firmware (server is authoritative
++        // for the transcript file, but UI follows the device).
++        const int64_t DOUBLE_TAP_WINDOW_MS = 600;
++        const int64_t LONG_PRESS_MS = 1500;
++        int64_t last_release_ms = 0;
++        int64_t press_started_ms = 0;
++        bool long_press_handled = false;
++        bool local_meeting_mode = false;
++        // Volume cycle order on long-press. Wraps after 100.
++        const int volume_cycle[] = {30, 50, 70, 95, 100};
++        const int volume_cycle_len = sizeof(volume_cycle) / sizeof(volume_cycle[0]);
++
+         while (true) {
+             if (touchpad->WaitForTouchEvent()) {
+                 auto &app = Application::GetInstance();
+@@ -725,12 +740,72 @@ private:
+                 ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
+                 touchpad->UpdateTouchPoint();
+                 auto touch_event = touchpad->CheckTouchEvent();
++                int64_t now_ms = esp_timer_get_time() / 1000;
++
++                if (touch_event == Cst816s::TOUCH_PRESS) {
++                    press_started_ms = now_ms;
++                    long_press_handled = false;
++                }
++                if (touch_event == Cst816s::TOUCH_HOLD && !long_press_handled &&
++                    press_started_ms != 0 && (now_ms - press_started_ms) >= LONG_PRESS_MS) {
++                    long_press_handled = true;
++                    auto* codec = board.GetAudioCodec();
++                    if (codec != nullptr) {
++                        int cur = codec->output_volume();
++                        int idx = 0;
++                        for (int i = 0; i < volume_cycle_len; i++) {
++                            if (cur < volume_cycle[i]) { idx = i; break; }
++                            if (i == volume_cycle_len - 1) idx = 0;
++                        }
++                        int next = volume_cycle[idx];
++                        codec->SetOutputVolume(next);
++                        char buf[32];
++                        snprintf(buf, sizeof(buf), "🔊 音量 %d", next);
++                        auto* d = static_cast<emote::EmoteDisplay*>(board.GetDisplay());
++                        if (d != nullptr) d->ShowNotification(buf, 1500);
++                        ESP_LOGI(TAG, "Long-press → volume=%d", next);
++                    }
++                }
+ 
+                 if (touch_event == Cst816s::TOUCH_RELEASE) {
+-                    if (app.GetDeviceState() == kDeviceStateStarting) {
+-                        board.EnterWifiConfigMode();
++                    press_started_ms = 0;
++                    // Long-press already consumed this gesture; don't fire
++                    // tap / double-tap actions on release.
++                    if (long_press_handled) {
++                        long_press_handled = false;
++                        continue;
++                    }
++                    bool is_double_tap = (last_release_ms != 0 &&
++                        (now_ms - last_release_ms) < DOUBLE_TAP_WINDOW_MS);
++
++                    if (is_double_tap) {
++                        // Skip ToggleChatState on the 2nd tap — calling it
++                        // again right after the 1st tap's state-change would
++                        // tear down the WS connection that the 1st tap just
++                        // established, which kills the meeting.toggle frame
++                        // mid-flight (1006 close).
++                        last_release_ms = 0;
++                        local_meeting_mode = !local_meeting_mode;
++                        ESP_LOGI(TAG, "Double-tap detected → meeting.toggle (now %s)",
++                                 local_meeting_mode ? "ON" : "OFF");
++                        // EmoteDisplay::SetMeetingMode hooks SetStatus +
++                        // SetChatMessage, so the bubble survives every
++                        // subsequent state-machine update (connecting,
++                        // listening, idle). No delay needed.
++                        auto* display = static_cast<emote::EmoteDisplay*>(board.GetDisplay());
++                        if (display != nullptr) {
++                            display->SetMeetingMode(local_meeting_mode);
++                        }
++                        app.SendMcpMessage(
++                            "{\"jsonrpc\":\"2.0\",\"method\":\"meeting.toggle\","
++                            "\"params\":{}}");
+                     } else {
+-                        app.ToggleChatState();
++                        last_release_ms = now_ms;
++                        if (app.GetDeviceState() == kDeviceStateStarting) {
++                            board.EnterWifiConfigMode();
++                        } else {
++                            app.ToggleChatState();
++                        }
+                     }
+                 }
+             }
+@@ -794,18 +869,26 @@ private:
+             ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
+         }
+ 
+-        bool gesture = false;
++        // Volume control via slider swipe. RIGHT = louder, LEFT = quieter.
+         if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
+-            gesture = true;
+-        } else if (event == TOUCH_SLIDER_EVENT_RELEASE) {
+-            gesture = true;
+-        }
+-
+-        if (!gesture) {
++            auto* codec = self->GetAudioCodec();
++            if (codec != nullptr) {
++                int v = codec->output_volume();
++                v += (event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) ? 10 : -10;
++                if (v < 0) v = 0;
++                if (v > 100) v = 100;
++                codec->SetOutputVolume(v);
++                char buf[32];
++                snprintf(buf, sizeof(buf), "🔊 音量 %d", v);
++                auto* d = static_cast<emote::EmoteDisplay*>(self->display_);
++                if (d != nullptr) d->ShowNotification(buf, 1500);
++                ESP_LOGI(TAG, "Slider swipe → volume=%d", v);
++            }
+             return;
+         }
+-
+-        self->ShowHappyTouchFeedback();
++        if (event == TOUCH_SLIDER_EVENT_RELEASE) {
++            self->ShowHappyTouchFeedback();
++        }
+     }
+ 
+     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
+diff --git a/main/display/emote_display.cc b/main/display/emote_display.cc
+index 7ed920a..35ab6f5 100644
+--- a/main/display/emote_display.cc
++++ b/main/display/emote_display.cc
+@@ -145,6 +145,14 @@ void EmoteDisplay::SetEmotion(const char* const emotion)
+ void EmoteDisplay::SetChatMessage(const char* const role, const char* const content)
+ {
+     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
++    // Meeting mode owns the bubble — drop other chat messages while active so
++    // STT echoes / LLM partials can't replace the persistent indicator.
++    if (meeting_mode_) {
++        if (emote_handle_) {
++            emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, "🎙 会议·静听");
++        }
++        return;
++    }
+     if (emote_handle_ && content && strlen(content) > 0) {
+         if ((std::strcmp(role, "system") == 0) && std::strstr(content, "xiaozhi.me")) {
+             size_t len = strlen(content);
+@@ -173,6 +181,25 @@ void EmoteDisplay::SetStatus(const char* const status)
+             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SET, NULL);
+         }
+     }
++    // After every status update, re-paint the meeting bubble so it survives
++    // connecting → listening → idle transitions.
++    if (meeting_mode_ && emote_handle_) {
++        emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, "🎙 会议·静听");
++    }
++}
++
++void EmoteDisplay::SetMeetingMode(const bool on)
++{
++    ESP_LOGI(TAG, "SetMeetingMode: %s", on ? "ON" : "OFF");
++    meeting_mode_ = on;
++    if (!emote_handle_) return;
++    if (on) {
++        emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, "🎙 会议·静听");
++    } else {
++        // Briefly show exit confirmation. The next SetStatus / chat message
++        // will replace it with normal UI naturally.
++        emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, "✓ 退出会议");
++    }
+ }
+ 
+ void EmoteDisplay::ShowNotification(const char* notification, int duration_ms)
+diff --git a/main/display/emote_display.h b/main/display/emote_display.h
+index 20f1870..502ca71 100644
+--- a/main/display/emote_display.h
++++ b/main/display/emote_display.h
+@@ -28,6 +28,12 @@ public:
+ 
+     void RefreshAll();
+ 
++    // Persistent meeting-mode banner. While `on`, every SetStatus and
++    // SetChatMessage gets shadowed by a re-applied "🎙 会议·静听" bubble so
++    // late-arriving state-machine updates (connecting, listening, etc.)
++    // can't overwrite the indicator.
++    void SetMeetingMode(bool on);
++
+     // Get emote handle for internal use
+     emote_handle_t GetEmoteHandle() const { return emote_handle_; }
+ 
+@@ -36,6 +42,7 @@ private:
+     virtual void Unlock() override;
+ 
+     emote_handle_t emote_handle_ = nullptr;
++    bool meeting_mode_ = false;
+ 
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+
